@@ -1,0 +1,18 @@
+# InsightFlow AI
+
+AI Powered Universal Data Analytics Platform.
+
+## Module 1 - Dataset Upload System
+
+This is the foundation module for the platform.
+
+### How to run
+
+1. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. Run the application:
+   ```bash
+   streamlit run app.py
+   ```
