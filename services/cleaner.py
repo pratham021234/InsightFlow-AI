@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 
 def detect_missing_values(df: pd.DataFrame) -> List[Dict[str, Any]]:
     missing = df.isna().sum()
-    missing_pct = (missing / len(df)) * 100
+    missing_pct = (missing / len(df)) * 100 if len(df) > 0 else 0
     missing_cols = missing[missing > 0].index.tolist()
     
     results = []
@@ -12,7 +12,7 @@ def detect_missing_values(df: pd.DataFrame) -> List[Dict[str, Any]]:
         dtype = str(df[col].dtype)
         if 'datetime' in dtype:
             suggestion = "Forward Fill"
-        elif df[col].dtype.kind in 'bifc':
+        elif pd.api.types.is_numeric_dtype(df[col]):
             suggestion = "Fill Median"
         else:
             suggestion = "Fill Mode"
@@ -27,12 +27,28 @@ def detect_missing_values(df: pd.DataFrame) -> List[Dict[str, Any]]:
 
 def fill_missing_values(df: pd.DataFrame, column: str, strategy: str) -> pd.DataFrame:
     df_clean = df.copy()
+    if column not in df_clean.columns:
+        return df_clean
+        
+    is_numeric = pd.api.types.is_numeric_dtype(df_clean[column])
+    
     if strategy == "Fill Mean":
-        val = df_clean[column].mean()
-        df_clean[column] = df_clean[column].fillna(val)
+        if is_numeric:
+            val = df_clean[column].mean()
+            df_clean[column] = df_clean[column].fillna(val)
+        else:
+            # Fallback to mode for non-numeric
+            mode_s = df_clean[column].mode()
+            if not mode_s.empty:
+                df_clean[column] = df_clean[column].fillna(mode_s.iloc[0])
     elif strategy == "Fill Median":
-        val = df_clean[column].median()
-        df_clean[column] = df_clean[column].fillna(val)
+        if is_numeric:
+            val = df_clean[column].median()
+            df_clean[column] = df_clean[column].fillna(val)
+        else:
+            mode_s = df_clean[column].mode()
+            if not mode_s.empty:
+                df_clean[column] = df_clean[column].fillna(mode_s.iloc[0])
     elif strategy == "Fill Mode":
         mode_series = df_clean[column].mode()
         if not mode_series.empty:
@@ -55,13 +71,16 @@ def detect_outliers(df: pd.DataFrame) -> List[Dict[str, Any]]:
     results = []
     num_cols = df.select_dtypes(include=[np.number]).columns
     for col in num_cols:
-        Q1 = df[col].quantile(0.25)
-        Q3 = df[col].quantile(0.75)
+        series = df[col].dropna()
+        if len(series) < 4:
+            continue
+        Q1 = series.quantile(0.25)
+        Q3 = series.quantile(0.75)
         IQR = Q3 - Q1
         lower = Q1 - 1.5 * IQR
         upper = Q3 + 1.5 * IQR
         
-        outliers = df[(df[col] < lower) | (df[col] > upper)]
+        outliers = series[(series < lower) | (series > upper)]
         if not outliers.empty:
             results.append({
                 "Column Name": col,
@@ -73,7 +92,6 @@ def detect_outliers(df: pd.DataFrame) -> List[Dict[str, Any]]:
     return results
 
 def remove_outliers(df: pd.DataFrame, column: str, lower: float, upper: float) -> pd.DataFrame:
-    # Filter rows ignoring NAs to avoid dropping missing values by accident during outlier removal
     mask = (df[column].isna()) | ((df[column] >= lower) & (df[column] <= upper))
     return df[mask]
 
@@ -86,28 +104,31 @@ def cap_outliers(df: pd.DataFrame, column: str, lower: float, upper: float) -> p
 def detect_dtype_issues(df: pd.DataFrame) -> List[Dict[str, str]]:
     results = []
     for col in df.select_dtypes(include=['object']).columns:
+        series = df[col].dropna()
+        if series.empty:
+            continue
+            
         # Check if it could be numeric
         try:
-            converted = pd.to_numeric(df[col].dropna())
+            converted = pd.to_numeric(series)
             if not converted.empty:
-                results.append({"Column Name": col, "Issue": "Numeric stored as object", "Suggestion": "Convert to Numeric"})
+                results.append({"Column Name": col, "Issue": "Numeric values stored as text", "Suggestion": "Convert to Numeric"})
                 continue
         except Exception:
             pass
         
         # Check if it could be datetime
         try:
-            # simple check on first non-null
-            first_val = df[col].dropna().iloc[0]
-            pd.to_datetime(str(first_val))
-            results.append({"Column Name": col, "Issue": "Date stored as string", "Suggestion": "Convert to Datetime"})
-            continue
+            converted_date = pd.to_datetime(series, errors='coerce')
+            if converted_date.notna().sum() > len(series) * 0.7:
+                results.append({"Column Name": col, "Issue": "Date values stored as text", "Suggestion": "Convert to Datetime"})
+                continue
         except Exception:
             pass
             
         # Check cardinality for category conversion
-        if df[col].nunique() < 20 and len(df) > 100:
-            results.append({"Column Name": col, "Issue": "Low cardinality string", "Suggestion": "Convert to Category"})
+        if series.nunique() < 20 and len(df) > 50:
+            results.append({"Column Name": col, "Issue": f"Low cardinality text ({series.nunique()} unique values)", "Suggestion": "Convert to Category"})
             
     return results
 

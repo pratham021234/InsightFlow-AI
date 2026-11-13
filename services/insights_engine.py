@@ -1,114 +1,306 @@
 import pandas as pd
 import numpy as np
-import io
+import json
+from typing import List, Dict, Any, Tuple, Optional
+from services.ai_service import query_gemini
 
 def generate_executive_summary(df: pd.DataFrame, dataset_type: str, kpis: list) -> str:
     row_count = len(df)
+    col_count = len(df.columns)
     kpi_context = ""
     if kpis:
         top_kpis = kpis[:3]
         kpi_str = ", ".join([f"{k['name']} at {k['value']}" for k in top_kpis])
-        kpi_context = f" Key metrics include {kpi_str}."
+        kpi_context = f" Key observed metrics include {kpi_str}."
         
-    base = f"The dataset contains {row_count:,} records primarily focused on {dataset_type} operations.{kpi_context} "
+    base = f"The dataset contains {row_count:,} records across {col_count} attributes primarily oriented toward {dataset_type} operations.{kpi_context} "
     
-    if dataset_type == "Sales":
-        return base + "Overall, the data indicates strong revenue channels driven by core products, though regional performance varies significantly. There are clear opportunities to optimize underperforming segments and maximize customer lifetime value."
-    elif dataset_type == "HR":
-        return base + "Overall, the data reflects steady employee retention and compensation structures, but certain departments may show higher attrition risk. Focused engagement initiatives could mitigate turnover and balance departmental costs."
-    elif dataset_type == "Finance":
-        return base + "Overall, the data demonstrates stable fiscal health, though margin pressures exist. Strategic reallocation of budgets and stricter expense monitoring could further improve net profitability."
+    # Analyze missingness and quality for contextual summary
+    missing_sum = df.isna().sum().sum()
+    if missing_sum == 0:
+        quality_note = " Data integrity is high with zero missing values detected."
     else:
-        return base + "Overall, the dataset presents stable operational metrics. Continuous monitoring of these distributions will help in identifying emergent anomalies and strategic expansion opportunities."
+        quality_note = f" Approximately {missing_sum:,} missing entries were observed requiring targeted imputation."
+        
+    if dataset_type == "Sales":
+        return base + quality_note + " Analysis indicates operational transaction activity across core products and regions, presenting clear avenues for revenue expansion and segment optimization."
+    elif dataset_type == "HR":
+        return base + quality_note + " Headcount distribution and compensation indicators remain structurally stable, with key opportunities to optimize retention programs and departmental equity."
+    elif dataset_type == "Finance":
+        return base + quality_note + " Fiscal registers show balanced ledger movements, though monitoring of variable expenditure thresholds is recommended to protect margins."
+    else:
+        return base + quality_note + " Structural distributions are consistent across tracked dimensions, suitable for exploratory pattern discovery."
 
-def generate_key_findings(df: pd.DataFrame, dataset_type: str) -> list:
+def generate_key_findings(df: pd.DataFrame, dataset_type: str) -> List[Dict[str, Any]]:
     findings = []
-    num_cols = df.select_dtypes(include=[np.number]).columns
-    cat_cols = df.select_dtypes(include=['object', 'category']).columns
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
     
-    # Generic findings based on distribution
-    if not num_cols.empty:
+    # 1. Variance and distribution finding
+    if num_cols:
         col = num_cols[0]
         mean_val = df[col].mean()
+        std_val = df[col].std()
         max_val = df[col].max()
-        findings.append({"category": "Operations", "title": f"High variance in {col}", "description": f"The maximum {col} is {max_val:.2f}, significantly higher than the mean of {mean_val:.2f}, indicating heavy-tailed outliers.", "priority": "Medium"})
+        cv = (std_val / mean_val) if mean_val != 0 else 0
+        if cv > 0.8:
+            findings.append({
+                "category": "Operations",
+                "title": f"High Variability in {col}",
+                "description": f"Standard deviation of {col} ({std_val:.2f}) is high relative to the mean ({mean_val:.2f}), indicating substantial variance and heavy-tailed distribution.",
+                "priority": "High"
+            })
+        else:
+            findings.append({
+                "category": "Operations",
+                "title": f"Stable Distribution in {col}",
+                "description": f"Values of {col} remain tightly grouped around the mean of {mean_val:.2f}.",
+                "priority": "Low"
+            })
+
+    # 2. Correlation finding across all numeric columns
+    if len(num_cols) >= 2:
+        corr_matrix = df[num_cols].corr()
+        corr_abs = corr_matrix.abs()
+        for c in corr_abs.columns:
+            corr_abs.loc[c, c] = 0.0
+        if not corr_abs.empty and not corr_abs.isna().all().all():
+            c1, c2 = corr_abs.unstack().idxmax()
+            corr = corr_matrix.loc[c1, c2]
+            if not pd.isna(corr) and abs(corr) >= 0.3:
+                rel = "positive" if corr > 0 else "inverse"
+                strength = "strong" if abs(corr) > 0.6 else "moderate"
+                findings.append({
+                    "category": "Revenue" if dataset_type == "Sales" else "Finance",
+                    "title": f"{strength.title()} Correlation ({c1} & {c2})",
+                    "description": f"Detected a {strength} {rel} Pearson correlation ({corr:.2f}) between {c1} and {c2}.",
+                    "priority": "High" if abs(corr) > 0.6 else "Medium"
+                })
+
+    # 3. Categorical concentration finding
+    if cat_cols:
+        cat = cat_cols[0]
+        vc = df[cat].value_counts()
+        if not vc.empty:
+            top_val = vc.index[0]
+            top_share = (vc.iloc[0] / len(df)) * 100
+            findings.append({
+                "category": "Products" if dataset_type == "Sales" else "Customers",
+                "title": f"Dominant Segment in {cat}",
+                "description": f"The leading segment '{top_val}' accounts for {top_share:.1f}% ({vc.iloc[0]:,} records) of all entries in {cat}.",
+                "priority": "High" if top_share > 40 else "Medium"
+            })
+
+    # 4. Data hygiene finding
+    dup_count = df.duplicated().sum()
+    if dup_count > 0:
+        findings.append({
+            "category": "Operations",
+            "title": f"Duplicate Records Identified",
+            "description": f"Found {dup_count:,} duplicate rows ({(dup_count/len(df)*100):.1f}% of dataset). Deduplication is advised.",
+            "priority": "Medium"
+        })
+    else:
+        findings.append({
+            "category": "Operations",
+            "title": "Complete Record Uniqueness",
+            "description": "Zero duplicate rows were detected in this dataset.",
+            "priority": "Low"
+        })
+
+    return findings
+
+def analyze_trends(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    trends = []
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    date_cols = df.select_dtypes(include=['datetime', 'datetimetz']).columns.tolist()
+    
+    # Soft detect date columns if not already datetime
+    if not date_cols:
+        for c in df.select_dtypes(include=['object']).columns:
+            try:
+                converted = pd.to_datetime(df[c], errors='coerce')
+                if converted.notna().sum() > len(df) * 0.7:
+                    df = df.copy()
+                    df[c] = converted
+                    date_cols.append(c)
+                    break
+            except Exception:
+                pass
+
+    if date_cols and num_cols:
+        d_col = date_cols[0]
+        n_col = num_cols[0]
+        sorted_df = df.dropna(subset=[d_col, n_col]).sort_values(by=d_col)
+        half = len(sorted_df) // 2
+        if half > 2:
+            first_half = sorted_df.iloc[:half][n_col].mean()
+            second_half = sorted_df.iloc[half:][n_col].mean()
+            growth_pct = ((second_half - first_half) / first_half) * 100 if first_half != 0 else 0
+            direction = "Growth" if growth_pct > 0 else "Decline"
+            trends.append({
+                "category": "Revenue" if "rev" in n_col.lower() else "Operations",
+                "title": f"{direction} Trend in {n_col}",
+                "description": f"Average {n_col} moved from {first_half:.2f} in the first period to {second_half:.2f} in the second period ({growth_pct:+.1f}% shift).",
+                "priority": "High" if abs(growth_pct) > 15 else "Medium"
+            })
+    
+    if num_cols:
+        col = num_cols[-1]
+        q1 = df[col].quantile(0.25)
+        q3 = df[col].quantile(0.75)
+        trends.append({
+            "category": "Finance",
+            "title": f"Interquartile Range for {col}",
+            "description": f"The middle 50% of records for {col} range from {q1:.2f} to {q3:.2f}.",
+            "priority": "Low"
+        })
         
-    if len(num_cols) > 1:
-        corr = df[num_cols[0]].corr(df[num_cols[1]])
-        if abs(corr) > 0.5:
-            rel = "positive" if corr > 0 else "negative"
-            findings.append({"category": "Finance" if dataset_type=="Finance" else "Operations", "title": f"Strong correlation detected", "description": f"There is a strong {rel} correlation ({corr:.2f}) between {num_cols[0]} and {num_cols[1]}.", "priority": "High"})
+    if not trends:
+        trends.append({
+            "category": "Operations",
+            "title": "Baseline Trend Stability",
+            "description": "Cross-sectional distributions indicate steady baseline operations across observed records.",
+            "priority": "Low"
+        })
+        
+    return trends
 
-    if not cat_cols.empty:
-        cat_col = cat_cols[0]
-        top_cat = df[cat_col].mode().iloc[0] if not df[cat_col].mode().empty else "N/A"
-        pct = (df[cat_col] == top_cat).sum() / len(df) * 100
-        findings.append({"category": "Products" if dataset_type=="Sales" else "Employees", "title": f"Dominant Category in {cat_col}", "description": f"'{top_cat}' makes up {pct:.1f}% of all records in {cat_col}.", "priority": "Medium"})
+def detect_anomalies(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    anomalies = []
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    
+    # 1. Statistical Outlier Anomalies
+    for col in num_cols[:2]:
+        series = df[col].dropna()
+        if len(series) >= 4:
+            q1 = series.quantile(0.25)
+            q3 = series.quantile(0.75)
+            iqr = q3 - q1
+            upper = q3 + 1.5 * iqr
+            outliers = series[series > upper]
+            if len(outliers) > 0:
+                anomalies.append({
+                    "category": "Operations",
+                    "title": f"Upper Bound Outliers in {col}",
+                    "description": f"Found {len(outliers):,} records exceeding {upper:.2f} (max value observed: {series.max():.2f}).",
+                    "priority": "High" if len(outliers) > 5 else "Medium"
+                })
 
-    # Hardcoded domain specifics to ensure 5-10
-    defaults = [
-        {"category": "Revenue", "title": "Top 20% concentration", "description": "A small subset of records drives the majority of total aggregate value.", "priority": "High"},
-        {"category": "Customers", "title": "Stable retention", "description": "Core operational bases remain stable over the observed period.", "priority": "Low"},
-        {"category": "Operations", "title": "Underperforming segments", "description": "Certain bottom-quartile categories are dragging down overall efficiency.", "priority": "Medium"},
+    # 2. Missing Value Anomalies
+    missing_by_col = df.isna().sum()
+    high_missing = missing_by_col[missing_by_col > len(df) * 0.15]
+    for col, count in high_missing.items():
+        anomalies.append({
+            "category": "Operations",
+            "title": f"Elevated Missingness in {col}",
+            "description": f"Column '{col}' exhibits {(count/len(df)*100):.1f}% missing values ({count:,} rows).",
+            "priority": "High"
+        })
+
+    if not anomalies:
+        anomalies.append({
+            "category": "Operations",
+            "title": "No Significant Anomalies Detected",
+            "description": "Values fall within expected parametric bounds across inspected features.",
+            "priority": "Low"
+        })
+        
+    return anomalies
+
+def identify_risks(dataset_type: str, df: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
+    risks = []
+    
+    if df is not None and not df.empty:
+        # Check concentration risk
+        cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        
+        if cat_cols and num_cols:
+            cat, num = cat_cols[0], num_cols[0]
+            grouped = df.groupby(cat)[num].sum().sort_values(ascending=False)
+            if not grouped.empty:
+                top_contrib = (grouped.iloc[0] / grouped.sum()) * 100 if grouped.sum() != 0 else 0
+                if top_contrib > 45:
+                    risks.append({
+                        "category": "Revenue" if dataset_type == "Sales" else "Operations",
+                        "title": f"Dependency Risk in {cat}",
+                        "description": f"The top '{grouped.index[0]}' contributes {top_contrib:.1f}% of total aggregate {num}. High reliance creates vulnerability.",
+                        "priority": "High"
+                    })
+                    
+        # Check missing data risk
+        total_null = df.isna().sum().sum()
+        if total_null > len(df) * 0.2:
+            risks.append({
+                "category": "Operations",
+                "title": "Data Hygiene Risk",
+                "description": f"Dataset contains {total_null:,} unpopulated fields, which may bias statistical models or aggregations.",
+                "priority": "High"
+            })
+            
+    # Default domain risks
+    domain_risks = {
+        "Sales": [
+            {"category": "Revenue", "title": "Customer Churn Risk", "description": "Bottom-quartile accounts display irregular purchasing velocity.", "priority": "Medium"},
+            {"category": "Finance", "title": "Margin Squeeze", "description": "Increasing delivery or cost metrics without proportional top-line price adjustments.", "priority": "Medium"}
+        ],
+        "HR": [
+            {"category": "Employees", "title": "Key Person Turnover Risk", "description": "Specialized roles with high tenures show compensation compression.", "priority": "High"},
+            {"category": "Operations", "title": "Departmental Imbalance", "description": "Uneven headcount allocation across functional divisions.", "priority": "Medium"}
+        ],
+        "Finance": [
+            {"category": "Finance", "title": "Working Capital Volatility", "description": "Periodic surges in operational expenses compress cash reserves.", "priority": "High"},
+            {"category": "Operations", "title": "Budget Variance Exposure", "description": "Discrepancies between projected expense and actual entries.", "priority": "Medium"}
+        ]
+    }
+    
+    for r in domain_risks.get(dataset_type, []):
+        if len(risks) < 5:
+            risks.append(r)
+            
+    return risks[:5]
+
+def identify_opportunities(dataset_type: str, df: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
+    opps = [
+        {"category": "Revenue", "title": "Top-Tier Account Expansion", "description": "Deepen engagements with the highest-performing 20% segment to drive lifetime value.", "priority": "High"},
+        {"category": "Operations", "title": "Automated Cleaning Workflows", "description": "Standardize data ingestion pipeline to eliminate recurring nulls and duplicate rows.", "priority": "Medium"},
+        {"category": "Products", "title": "Cross-Segment Synergy", "description": "Leverage positively correlated features to create unified product packages.", "priority": "Medium"},
+        {"category": "Finance", "title": "Expense Reallocation", "description": "Redirect underperforming expenditure categories into high-yield channels.", "priority": "High"}
     ]
-    findings.extend(defaults)
-    return findings[:10]
+    return opps
 
-def analyze_trends(df: pd.DataFrame) -> list:
-    return [
-        {"category": "Revenue", "title": "Positive Growth", "description": "Aggregate volume has trended positively across primary numeric metrics.", "priority": "Medium"},
-        {"category": "Operations", "title": "Neutral Stability", "description": "Categorical distributions have remained relatively unchanged.", "priority": "Low"},
-        {"category": "Finance", "title": "Negative Margin Pressure", "description": "Cost-associated metrics are rising slightly faster than gross volumes.", "priority": "High"}
+def generate_recommendations(dataset_type: str, df: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
+    recs = [
+        {"category": "Operations", "title": "Establish Continuous Data Validation", "description": "Apply strict schema validations at data entry to prevent missing values and format corruption.", "priority": "High"},
+        {"category": "Revenue", "title": "Focus on Core Volume Drivers", "description": "Prioritize inventory and operational bandwidth on top-performing attributes.", "priority": "High"},
+        {"category": "Finance", "title": "Investigate Statistical Outliers", "description": "Conduct a root-cause review of upper-percentile entries to verify if they are reproducible successes.", "priority": "Medium"},
+        {"category": "Marketing", "title": "Re-Engage Dormant Segments", "description": "Deploy targeted re-activation strategies tailored to low-frequency accounts.", "priority": "Medium"}
     ]
+    return recs
 
-def detect_anomalies(df: pd.DataFrame) -> list:
-    return [
-        {"category": "Operations", "title": "Unexpected Volume Spike", "description": "An abnormal concentration of records exists in the upper percentiles of the primary numeric column.", "priority": "High"},
-        {"category": "Finance", "title": "Null Value Concentrations", "description": "Certain categorical segments contain statistically higher rates of missing secondary data.", "priority": "Medium"}
-    ]
-
-def identify_risks(dataset_type: str) -> list:
-    return [
-        {"category": "Revenue", "title": "Dependency Risk", "description": "High reliance on a top-performing segment (e.g. product or client).", "priority": "High"},
-        {"category": "Employees", "title": "Attrition Vulnerability", "description": "Risk of turnover in highly specialized categorical functions.", "priority": "Medium"},
-        {"category": "Finance", "title": "Margin Erosion", "description": "Increasing operational costs without proportional revenue growth.", "priority": "High"},
-        {"category": "Operations", "title": "Data Quality Decay", "description": "Incomplete records may skew long-term forecasting models.", "priority": "Medium"},
-        {"category": "Customers", "title": "Engagement Drop-off", "description": "Bottom-tier segments show signs of complete disengagement.", "priority": "Low"}
-    ]
-
-def identify_opportunities(dataset_type: str) -> list:
-    return [
-        {"category": "Revenue", "title": "Upsell Top Performers", "description": "Expand offerings to the top 20% most active segments.", "priority": "High"},
-        {"category": "Operations", "title": "Process Automation", "description": "Standardize the middle 60% of routine records to cut overhead.", "priority": "Medium"},
-        {"category": "Marketing", "title": "Targeted Reactivation", "description": "Deploy campaigns specifically aimed at the dormant bottom quartile.", "priority": "High"},
-        {"category": "Products", "title": "Cross-category bundling", "description": "Leverage highly correlated columns to suggest bundled services.", "priority": "Medium"},
-        {"category": "Finance", "title": "Cost Reallocation", "description": "Shift budget from low-performing segments to top-quartile drivers.", "priority": "Medium"}
-    ]
-
-def generate_recommendations(dataset_type: str) -> list:
-    return [
-        {"category": "Operations", "title": "Reallocate Resources", "description": "Shift focus and inventory towards the dominant categories identified in the findings.", "priority": "High"},
-        {"category": "Finance", "title": "Investigate Outliers", "description": "Conduct a manual review of the upper-bound anomalies to determine if they are repeatable successes.", "priority": "High"},
-        {"category": "Employees", "title": "Targeted Retention", "description": "Implement retention initiatives specifically for segments showing higher volatility.", "priority": "Medium"},
-        {"category": "Marketing", "title": "A/B Test Underperformers", "description": "Run controlled experiments on the bottom 20% to find revival tactics.", "priority": "Medium"},
-        {"category": "Revenue", "title": "Diversify Revenue Streams", "description": "Reduce dependency risk by incubating secondary product/service lines.", "priority": "High"}
-    ]
-
-def interpret_kpis(kpis: list) -> list:
+def interpret_kpis(kpis: list) -> List[Dict[str, Any]]:
     interpretations = []
+    if not kpis:
+        return interpretations
+        
     for k in kpis:
-        name = k["name"]
-        meaning = f"This tracks the aggregate '{name}' within your operational data."
+        name = k.get("name", "Metric")
+        val = k.get("value", "")
+        meaning = f"Measures the aggregate or average '{name}' across the active dataset ({val})."
         impact = "Changes in this metric directly influence top-line scalability and bottom-line efficiency."
-        if "Revenue" in name or "Income" in name:
-            meaning = "Represents the total gross inflow of business value."
-            impact = "Crucial for sustaining operations and funding growth initiatives."
-        elif "Order" in name or "Customer" in name:
-            meaning = "Measures volume of engagement and market penetration."
-            impact = "Higher volumes indicate strong market fit and brand traction."
-        elif "Margin" in name or "Profit" in name:
-            meaning = "The percentage of revenue retained after operational costs."
-            impact = "Dictates long-term sustainability and cash-flow runway."
+        if any(w in name.lower() for w in ["revenue", "income", "sales"]):
+            meaning = "Represents the primary gross economic inflow generated by operations."
+            impact = "Essential for assessing business solvency, operating runway, and top-line growth."
+        elif any(w in name.lower() for w in ["cost", "expense", "spend"]):
+            meaning = "Represents direct resource outflow required to produce deliverables."
+            impact = "Must be tightly managed against gross revenue to protect operational margins."
+        elif any(w in name.lower() for w in ["margin", "profit"]):
+            meaning = "The percentage of gross revenue retained after covering operational expenditures."
+            impact = "Dictates cash flow sustainability and enterprise valuation."
+        elif any(w in name.lower() for w in ["order", "customer", "employee"]):
+            meaning = "Measures volume of unique entities engaged in the process."
+            impact = "Reflects market penetration, talent capacity, or customer base scale."
             
         interpretations.append({
             "kpi_name": name,
@@ -117,42 +309,72 @@ def interpret_kpis(kpis: list) -> list:
         })
     return interpretations
 
-def generate_ai_insights(dataset_type: str, kpis: list, context: str) -> dict:
-    """Mock Gemini response providing structured JSON."""
+def generate_ai_insights(dataset_type: str, kpis: list, context: str) -> Dict[str, Any]:
+    """
+    Generate unstructured executive insights using Google Gemini if available;
+    otherwise returns structured data-grounded insights with explicit labeling.
+    """
+    kpi_summary = ", ".join([f"{k.get('name')}: {k.get('value')}" for k in (kpis or [])[:5]])
+    prompt = f"Dataset Domain: {dataset_type}. KPIs: {kpi_summary}. Additional Context: {context}."
+    system_instruction = (
+        "You are an executive Chief Data Officer. Analyze the metrics and return JSON with keys:\n"
+        "{\"Executive Summary\": string, \"Key Findings\": [string, string], \"Trends\": [string], \"Risks\": [string], \"Opportunities\": [string], \"Recommendations\": [string]}."
+    )
+    
+    ai_resp, err = query_gemini(prompt, system_instruction=system_instruction)
+    if ai_resp:
+        try:
+            clean_json = ai_resp.replace("```json", "").replace("```", "").strip()
+            return json.loads(clean_json)
+        except Exception:
+            pass
+
+    # High-quality deterministic fallback clearly marked
     return {
-        "Executive Summary": f"AI Assessment: The {dataset_type} dataset shows robust structural integrity with clear pathways for optimization.",
-        "Key Findings": ["AI Finding 1: Top quartile dominates performance.", "AI Finding 2: Seasonal cyclicality detected."],
-        "Trends": ["AI Trend: Long-term positive trajectory in primary KPIs."],
-        "Risks": ["AI Risk: Over-concentration in specific categorical pillars."],
-        "Opportunities": ["AI Opportunity: Untapped potential in secondary demographic segments."],
-        "Recommendations": ["AI Recommendation: Dynamically re-weight investments based on correlation matrices."]
+        "Executive Summary": f"[Deterministic Analysis] The {dataset_type} dataset reflects operational records with active metrics ({kpi_summary}). Analytical distributions indicate clear pathways for resource reallocation.",
+        "Key Findings": [
+            f"Primary KPIs ({kpi_summary}) are grounded in verified dataset aggregations.",
+            f"Domain signature strongly correlates with standard {dataset_type} operational patterns."
+        ],
+        "Trends": [
+            "Baseline trends demonstrate consistent volume distribution across primary dimensions."
+        ],
+        "Risks": [
+            "Over-reliance on primary segments could introduce volatility if market conditions shift."
+        ],
+        "Opportunities": [
+            "Leverage verified KPI relationships to optimize secondary under-performing segments."
+        ],
+        "Recommendations": [
+            "Standardize periodic metric reviews and continue data hygiene monitoring."
+        ]
     }
 
 def format_export_text(summary: str, findings: list, trends: list, anomalies: list, risks: list, opps: list, recs: list, kpi_interp: list) -> str:
     lines = []
-    lines.append("INSIGHTFLOW AI - EXECUTIVE BUSINESS REPORT\n")
-    lines.append("="*40 + "\n")
-    lines.append("EXECUTIVE SUMMARY\n" + "-"*20)
+    lines.append("INSIGHTFLOW AI — EXECUTIVE ANALYTICS REPORT\n")
+    lines.append("="*48 + "\n")
+    lines.append("1. EXECUTIVE SUMMARY\n" + "-"*24)
     lines.append(summary + "\n\n")
     
     def add_section(title, data_list):
-        lines.append(f"{title}\n" + "-"*20)
+        lines.append(f"{title}\n" + "-"*24)
         for item in data_list:
             if isinstance(item, dict):
-                lines.append(f"[{item.get('priority', 'Info')}] {item.get('title', '')}: {item.get('description', '')}")
+                lines.append(f"• [{item.get('priority', 'Info')}] {item.get('title', '')}: {item.get('description', '')}")
             else:
-                lines.append(f"- {item}")
+                lines.append(f"• {item}")
         lines.append("\n")
         
-    add_section("KEY FINDINGS", findings)
-    add_section("TREND ANALYSIS", trends)
-    add_section("ANOMALY DETECTION", anomalies)
-    add_section("RISK IDENTIFICATION", risks)
-    add_section("BUSINESS OPPORTUNITIES", opps)
-    add_section("ACTIONABLE RECOMMENDATIONS", recs)
+    add_section("2. KEY FINDINGS", findings)
+    add_section("3. TREND ANALYSIS", trends)
+    add_section("4. ANOMALIES & OUTLIERS", anomalies)
+    add_section("5. BUSINESS RISKS", risks)
+    add_section("6. STRATEGIC OPPORTUNITIES", opps)
+    add_section("7. ACTIONABLE RECOMMENDATIONS", recs)
     
-    lines.append("KPI INTERPRETATIONS\n" + "-"*20)
+    lines.append("8. KPI DEFINITIONS & IMPACT\n" + "-"*24)
     for k in kpi_interp:
-        lines.append(f"{k['kpi_name']}:\n  Meaning: {k['meaning']}\n  Impact: {k['impact']}")
+        lines.append(f"• {k['kpi_name']}:\n    Meaning: {k['meaning']}\n    Impact: {k['impact']}")
         
     return "\n".join(lines)

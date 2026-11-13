@@ -11,22 +11,29 @@ def _format_size(size_bytes: int) -> str:
 
 def get_dataset_overview(df: pd.DataFrame) -> Dict[str, Any]:
     memory_usage = df.memory_usage(deep=True).sum()
+    total_cells = df.shape[0] * df.shape[1] if df.shape[0] * df.shape[1] > 0 else 1
+    total_missing = int(df.isna().sum().sum())
     return {
         "Total Rows": len(df),
         "Total Columns": len(df.columns),
         "Memory Usage": _format_size(memory_usage),
-        "Total Missing Values": int(df.isna().sum().sum()),
+        "Total Missing Values": total_missing,
+        "Missing Ratio": f"{(total_missing / total_cells) * 100:.2f}%",
         "Duplicate Rows": int(df.duplicated().sum()),
+        "Duplicate Ratio": f"{(df.duplicated().sum() / len(df) * 100):.2f}%" if len(df) > 0 else "0.00%",
         "Unique Values": int(df.nunique().sum())
     }
 
 def get_column_profile(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
     profile_data = []
+    total_rows = len(df) if len(df) > 0 else 1
     for col in df.columns:
+        null_count = int(df[col].isna().sum())
         profile_data.append({
             "Column Name": col,
             "Data Type": str(df[col].dtype),
-            "Null Count": int(df[col].isna().sum()),
+            "Null Count": null_count,
+            "Null %": f"{(null_count / total_rows) * 100:.1f}%",
             "Unique Count": int(df[col].nunique())
         })
     profile_df = pd.DataFrame(profile_data)
@@ -34,7 +41,7 @@ def get_column_profile(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
     type_counts = {
         "Numeric Columns": len(df.select_dtypes(include=[np.number]).columns),
         "Categorical Columns": len(df.select_dtypes(include=['object', 'category']).columns),
-        "Date Columns": len(df.select_dtypes(include=['datetime']).columns),
+        "Date Columns": len(df.select_dtypes(include=['datetime', 'datetimetz']).columns),
         "Boolean Columns": len(df.select_dtypes(include=['bool']).columns)
     }
     type_counts["Other Columns"] = len(df.columns) - sum(type_counts.values())
@@ -42,12 +49,14 @@ def get_column_profile(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
     return profile_df, type_counts
 
 def get_missing_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or len(df) == 0:
+        return pd.DataFrame(columns=["Column", "Missing Count", "Missing %"])
     missing_count = df.isna().sum()
     missing_percent = (missing_count / len(df)) * 100
     missing_df = pd.DataFrame({
         "Column": df.columns,
         "Missing Count": missing_count.values,
-        "Missing %": missing_percent.values
+        "Missing %": np.round(missing_percent.values, 2)
     }).sort_values(by="Missing Count", ascending=False).reset_index(drop=True)
     return missing_df
 
@@ -61,7 +70,7 @@ def get_duplicate_analysis(df: pd.DataFrame) -> Dict[str, Any]:
 
 def get_statistical_summary(df: pd.DataFrame) -> pd.DataFrame:
     num_df = df.select_dtypes(include=[np.number])
-    if num_df.empty:
+    if num_df.empty or len(num_df) == 0:
         return pd.DataFrame()
     stats = num_df.describe().T
     
@@ -74,13 +83,14 @@ def get_statistical_summary(df: pd.DataFrame) -> pd.DataFrame:
     stats = stats.rename(columns={
         "mean": "Mean", "50%": "Median", "min": "Min", "max": "Max", "std": "Std Dev"
     })
-    return stats[['Mean', 'Median', 'Mode', 'Min', 'Max', 'Std Dev', 'Variance']]
+    cols_order = [c for c in ['Mean', 'Median', 'Mode', 'Min', 'Max', 'Std Dev', 'Variance'] if c in stats.columns]
+    return stats[cols_order].round(3)
 
 def get_correlation_matrix(df: pd.DataFrame) -> pd.DataFrame:
     num_df = df.select_dtypes(include=[np.number])
-    if num_df.empty:
+    if num_df.empty or num_df.shape[1] < 2:
         return pd.DataFrame()
-    return num_df.corr(numeric_only=True)
+    return num_df.corr(numeric_only=True).round(3)
 
 def get_categorical_analysis(df: pd.DataFrame) -> Dict[str, Any]:
     cat_df = df.select_dtypes(include=['object', 'category'])
@@ -97,42 +107,50 @@ def get_categorical_analysis(df: pd.DataFrame) -> Dict[str, Any]:
     return results
 
 def get_date_analysis(df: pd.DataFrame) -> Dict[str, Any]:
-    # Soft conversion to datetime for object columns that might be dates
     temp_df = df.copy()
+    results = {}
+    
+    # First check existing datetime columns
+    date_cols = temp_df.select_dtypes(include=['datetime', 'datetimetz']).columns.tolist()
+    
+    # Also inspect object columns that might represent dates
     for col in temp_df.select_dtypes(include=['object']).columns:
         try:
-            # We don't want to accidentally convert numerical strings, so only try if it looks like a date
-            converted = pd.to_datetime(temp_df[col], errors='ignore')
-            if pd.api.types.is_datetime64_any_dtype(converted):
+            converted = pd.to_datetime(temp_df[col], errors='coerce')
+            if converted.notna().sum() > len(temp_df) * 0.7:  # At least 70% valid dates
                 temp_df[col] = converted
+                date_cols.append(col)
         except Exception:
             pass
 
-    date_cols = temp_df.select_dtypes(include=['datetime', 'datetimetz']).columns
-    results = {}
-    for col in date_cols:
-        results[col] = {
-            "Minimum Date": temp_df[col].min(),
-            "Maximum Date": temp_df[col].max(),
-            "Date Range": str(temp_df[col].max() - temp_df[col].min())
-        }
+    for col in set(date_cols):
+        series = temp_df[col].dropna()
+        if not series.empty:
+            min_date = series.min()
+            max_date = series.max()
+            results[col] = {
+                "Minimum Date": str(min_date)[:19],
+                "Maximum Date": str(max_date)[:19],
+                "Date Range": str(max_date - min_date)
+            }
     return results
 
 def get_quality_indicators(df: pd.DataFrame) -> Dict[str, str]:
-    if df.empty:
+    if df.empty or len(df) == 0:
         return {}
         
-    # Missing Values
-    missing_pct = df.isna().sum().sum() / (df.shape[0] * df.shape[1])
+    # Missing Values Indicator
+    total_cells = df.shape[0] * df.shape[1]
+    missing_pct = df.isna().sum().sum() / total_cells if total_cells > 0 else 0
     if missing_pct == 0:
         missing_status = "Good"
-    elif missing_pct < 0.1:
+    elif missing_pct < 0.08:
         missing_status = "Warning"
     else:
         missing_status = "Critical"
         
-    # Duplicates
-    dup_pct = df.duplicated().sum() / len(df)
+    # Duplicates Indicator
+    dup_pct = df.duplicated().sum() / len(df) if len(df) > 0 else 0
     if dup_pct == 0:
         dup_status = "Good"
     elif dup_pct < 0.05:
@@ -140,7 +158,7 @@ def get_quality_indicators(df: pd.DataFrame) -> Dict[str, str]:
     else:
         dup_status = "Critical"
         
-    # Data Type Consistency - Simplistic check for mixed types in object columns
+    # Data Type Consistency Indicator
     mixed_types = False
     for col in df.select_dtypes(include=['object']).columns:
         if df[col].apply(type).nunique() > 1:
@@ -148,11 +166,11 @@ def get_quality_indicators(df: pd.DataFrame) -> Dict[str, str]:
             break
     type_status = "Warning" if mixed_types else "Good"
     
-    # Memory Efficiency
+    # Memory Efficiency Indicator
     mem_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
     if mem_mb < 50:
         mem_status = "Good"
-    elif mem_mb < 100:
+    elif mem_mb < 150:
         mem_status = "Warning"
     else:
         mem_status = "Critical"
